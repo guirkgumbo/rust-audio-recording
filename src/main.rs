@@ -1,45 +1,57 @@
-use hound::WavReader;
-use lame::Config;
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use hound::{WavSpec, WavWriter};
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Write};
+use std::sync::mpsc::{Receiver, Sender};
+use std::thread;
 
 fn main() {
-    // Open the input WAV file
-    let input_filename = "input.wav";
-    let reader = WavReader::open(input_filename).unwrap();
-    let spec = reader.spec();
-    let samples: Vec<i16> = reader.into_samples::<i16>().map(|x| x.unwrap()).collect();
+    let host = cpal::default_host();
+    let device = host
+        .default_input_device()
+        .expect("Failed to get default input device");
 
-    // Open the output MP3 file
-    let output_filename = "output.mp3";
-    let file = File::create(output_filename).unwrap();
-    let mut writer = BufWriter::new(file);
+    let config: cpal::SupportedStreamConfig = device
+        .default_input_config()
+        .expect("Failed to get default input config");
+    println!("Using input config: {:?}", config);
 
-    // Configure the MP3 encoder
-    let config = Config::new()
-        .sample_rate(spec.sample_rate)
-        .channels(spec.channels)
-        .bitrate(192);
+    let spec = WavSpec {
+        channels: config.channels(),
+        sample_rate: config.sample_rate().0,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut writer = WavWriter::create("output.wav", spec).unwrap();
 
-    // Encode the audio samples to MP3 and write them to the output file
-    let mut encoder = config.build().unwrap();
-    let mut mp3_samples = Vec::new();
-    let mut remaining_samples = &samples[..];
-    loop {
-        match encoder.encode(remaining_samples, &mut mp3_samples) {
-            Ok(_) => {}
-            Err(_) => break,
-        };
-        if remaining_samples.len() <= encoder.samples_to_encode() {
-            break;
-        }
-        remaining_samples = &remaining_samples[encoder.samples_to_encode()..];
+    let (tx, rx) = std::sync::mpsc::channel();
+    let stream = device.build_input_stream(
+        &config.into(),
+        move |data: &[i16], _: &_| {
+            tx.send(data.to_vec()).unwrap();
+        },
+        err_fn,
+    ).unwrap();
+
+    stream.play().unwrap();
+
+    // Capture audio for a fixed duration
+    let capture_duration = std::time::Duration::from_secs(5);
+    let mut samples = Vec::new();
+    let mut total_samples = 0;
+
+    while total_samples < (spec.sample_rate as usize * capture_duration.as_secs() as usize) {
+        let audio_data = rx.recv().unwrap();
+        samples.extend(audio_data.iter().cloned());
+        total_samples += audio_data.len();
     }
-    match encoder.flush(&mut mp3_samples) {
-        Ok(_) => {}
-        Err(_) => {}
-    }
-    writer.write_all(&mp3_samples).unwrap();
 
-    println!("Finished converting {} to {}", input_filename, output_filename);
+    for sample in samples {
+        writer.write_sample(sample).unwrap();
+    }
+
+    println!("Finished recording to output.wav");
+}
+
+fn err_fn(err: cpal::StreamError) {
+    eprintln!("cpal stream error: {}", err);
 }
